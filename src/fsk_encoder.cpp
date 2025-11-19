@@ -3,6 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <cstdint>
 
 // ----------------------------------
 // THIS GENERATES SIN WAVES
@@ -20,6 +21,19 @@ std::vector<double> generateSineWave(double freq, double duration,
     }
 
     return samples;
+}
+
+// ----------------------------------
+// CONVERTS AN INTEGER TO 16 BITS
+// ----------------------------------
+std::string intTo16Bits(uint16_t value)
+{
+    std::string bits(16, '0');
+    for (int i = 15; i >= 0; --i)
+    {
+        bits[15 - i] = ((value >> i) & 1) ? '1' : '0';
+    }
+    return bits;
 }
 
 // ----------------------------------
@@ -85,19 +99,17 @@ void saveWav(const std::string& filename, const std::vector<double>& samples, in
 // ----------------------------------
 // FSK ENCODER
 // ----------------------------------
-std::vector<double> fskEncode(const std::string& text,
-                              double f0, double f1,
-                              double bitDuration,
-                              int sampleRate)
+std::vector<double> fskEncodeBits(const std::string& bits,
+                                  double f0, double f1,
+                                  double bitDuration,
+                                  int sampleRate)
 {
-    std::string bits = textToBits(text);
     std::vector<double> waveData;
 
     for (char bit : bits)
     {
         double freq = (bit == '1') ? f1 : f0;
         std::vector<double> tone = generateSineWave(freq, bitDuration, sampleRate);
-
         waveData.insert(waveData.end(), tone.begin(), tone.end());
     }
 
@@ -117,13 +129,31 @@ int main()
 
     double f0 = 35000;      // FREQUENCY FOR 0
     double f1 = 45000;      // FREQUENCY FOR 1
-    double bitDuration = 0.005;  // 200 BITS / SEC (DECREASE FOR FASTER BUT LESS RELIABLE)
-    int sampleRate = 44100;      // SAMPLE RATE (CHANGE THIS IF NEEDED)
+    double bitDuration = 0.005;
+    int sampleRate = 44100;
 
-    std::vector<double> samples = fskEncode(message, f0, f1, bitDuration, sampleRate);
+    // ----------------------------------
+    // PACKET FORMAT
+    // ----------------------------------
+
+    const std::string SYNC = "1111000011110000"; // SYNC WORD
+
+    uint16_t lengthBytes = static_cast<uint16_t>(message.size());
+    std::string lengthBits = intTo16Bits(lengthBytes);
+
+    std::string payloadBits = textToBits(message);
+
+    // Final bitstream
+    std::string finalBits = SYNC + lengthBits + payloadBits;
+
+    // ----------------------------------
+    // FSK ENCODE BITSTREAM
+    // ----------------------------------
+    std::vector<double> samples = fskEncodeBits(finalBits, f0, f1, bitDuration, sampleRate);
 
     saveWav("auxon_fsk.wav", samples, sampleRate);
 
     std::cout << "Saved as auxon_fsk.wav\n";
+
     return 0;
 }
