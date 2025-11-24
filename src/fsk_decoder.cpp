@@ -4,6 +4,11 @@
 #include <cmath>
 #include <string>
 #include <cstdint>
+#include <algorithm>
+
+#include "kiss_fft.h"
+
+constexpr double PI = 3.14159265358979323846;
 
 // ----------------------
 // WAV LOADER
@@ -109,33 +114,6 @@ bool loadWav(const std::string& filename, WavData& out) {
     return true;
 }
 
-
-// ----------------------
-// GOERTZEL
-// ----------------------
-double goertzelPower(const std::vector<double>& data, int start, int len,
-                     double targetFreq, int sampleRate)
-{
-    if (len <= 0) return 0.0;
-
-    double kf = 0.5 + (len * targetFreq) / sampleRate;
-    int k = static_cast<int>(kf);
-    double omega = (2.0 * 3.14159265358979323846 * k) / len;
-    double coeff = 2.0 * std::cos(omega);
-
-    double s0 = 0, s1 = 0, s2 = 0;
-
-    for (int n = 0; n < len; ++n) {
-        double x = data[start + n];
-        s0 = x + coeff * s1 - s2;
-        s2 = s1;
-        s1 = s0;
-    }
-
-    return s1 * s1 + s2 * s2 - coeff * s1 * s2;
-}
-
-
 // ----------------------
 // BITS → TEXT
 // ----------------------
@@ -149,14 +127,15 @@ std::string bitsToText(const std::string& bits) {
     return result;
 }
 
-
 // ----------------------
 // MAIN DECODER
 // ----------------------
 int main() {
     const std::string inputFile = "auxon_fsk.wav";
-    const double f0 = 35000.0;
-    const double f1 = 45000.0;
+
+    // TRANSMIT freqs (what encoder thinks it’s using)
+    const double txF0 = 35000.0;
+    const double txF1 = 45000.0;
     const double bitDuration = 0.005;
 
     const std::string SYNC = "1111000011110000";
@@ -165,23 +144,85 @@ int main() {
     if (!loadWav(inputFile, wav)) return 1;
 
     int sampleRate = wav.sampleRate;
+
+    // Compute effective (aliased) frequencies inside the WAV
+    auto aliasFreq = [&](double f) -> double {
+        double ratio = f / sampleRate;
+        double k = std::round(ratio);
+        double fa = std::fabs(f - k * sampleRate);
+        return fa;
+    };
+
+    double f0_dec = aliasFreq(txF0);
+    double f1_dec = aliasFreq(txF1);
+
     int samplesPerBit = static_cast<int>(bitDuration * sampleRate);
+    if (samplesPerBit <= 0) {
+        std::cerr << "Invalid samplesPerBit\n";
+        return 1;
+    }
+
+    int FFT_N = samplesPerBit;
+
+    kiss_fft_cfg cfg = kiss_fft_alloc(FFT_N, 0, nullptr, nullptr);
+    if (!cfg) {
+        std::cerr << "Failed to allocate KissFFT config\n";
+        return 1;
+    }
 
     std::cout << "Loaded WAV with " << wav.samples.size() << " samples.\n";
+    std::cout << "Sample rate: " << sampleRate << " Hz\n";
+    std::cout << "Samples per bit: " << samplesPerBit << "\n";
+    std::cout << "FFT size per bit: " << FFT_N << "\n";
+    std::cout << "Decoded carrier freqs (alias): f0=" << f0_dec
+              << " Hz, f1=" << f1_dec << " Hz\n";
+
+    // ----------------------
+    // FSK BIT DETECTION USING FFT
+    // ----------------------
+    auto detectBitFFT = [&](int start) -> char {
+        std::vector<kiss_fft_cpx> fft_in(FFT_N);
+        std::vector<kiss_fft_cpx> fft_out(FFT_N);
+
+        int remaining = static_cast<int>(wav.samples.size()) - start;
+        int copySize = std::min(remaining, FFT_N);
+
+        for (int i = 0; i < copySize; ++i) {
+            double w = 0.5 * (1.0 - std::cos(2.0 * PI * i / (copySize - 1)));
+            fft_in[i].r = wav.samples[start + i] * w;
+            fft_in[i].i = 0.0;
+        }
+        for (int i = copySize; i < FFT_N; ++i) {
+            fft_in[i].r = 0.0;
+            fft_in[i].i = 0.0;
+        }
+
+        kiss_fft(cfg, fft_in.data(), fft_out.data());
+
+        int bin0 = static_cast<int>(std::round(f0_dec * FFT_N / sampleRate));
+        int bin1 = static_cast<int>(std::round(f1_dec * FFT_N / sampleRate));
+
+        if (bin0 < 0 || bin0 >= FFT_N || bin1 < 0 || bin1 >= FFT_N) {
+            return '0';
+        }
+
+        double mag0 = std::hypot(fft_out[bin0].r, fft_out[bin0].i);
+        double mag1 = std::hypot(fft_out[bin1].r, fft_out[bin1].i);
+
+        return (mag1 > mag0) ? '1' : '0';
+    };
 
     // Extract raw bitstream
     std::string bitstream;
-    int numBits = wav.samples.size() / samplesPerBit;
+    int numBits = static_cast<int>(wav.samples.size()) / samplesPerBit;
     bitstream.reserve(numBits);
 
     for (int b = 0; b < numBits; b++) {
         int start = b * samplesPerBit;
-        if (start + samplesPerBit > wav.samples.size()) break;
+        if (start >= static_cast<int>(wav.samples.size())) break;
 
-        double p0 = goertzelPower(wav.samples, start, samplesPerBit, f0, sampleRate);
-        double p1 = goertzelPower(wav.samples, start, samplesPerBit, f1, sampleRate);
-
-        bitstream.push_back((p1 > p0) ? '1' : '0');
+        char bit = detectBitFFT(start);
+        bitstream.push_back(bit);
     }
 
     std::cout << "Total bits recovered: " << bitstream.size() << "\n";
@@ -190,13 +231,14 @@ int main() {
     std::size_t pos = bitstream.find(SYNC);
     if (pos == std::string::npos) {
         std::cerr << "SYNC WORD NOT FOUND – noise or bad signal.\n";
+        kiss_fft_free(cfg);
         return 1;
     }
     std::cout << "Sync word found at bit index: " << pos << "\n";
 
-    // Extract length field (next 16 bits)
     if (pos + SYNC.size() + 16 > bitstream.size()) {
         std::cerr << "Bitstream too short for length.\n";
+        kiss_fft_free(cfg);
         return 1;
     }
 
@@ -205,12 +247,12 @@ int main() {
 
     std::cout << "Payload length = " << msgLen << " bytes\n";
 
-    // Extract payload bits
     std::size_t payloadStart = pos + SYNC.size() + 16;
     std::size_t payloadBitsNeeded = msgLen * 8;
 
     if (payloadStart + payloadBitsNeeded > bitstream.size()) {
         std::cerr << "Bitstream too short for expected payload.\n";
+        kiss_fft_free(cfg);
         return 1;
     }
 
@@ -223,5 +265,6 @@ int main() {
     out << message;
     out.close();
 
+    kiss_fft_free(cfg);
     return 0;
 }
